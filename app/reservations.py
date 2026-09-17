@@ -1,10 +1,12 @@
-"""会议预约核心逻辑：幂等创建 + 单事务冲突检测。
+"""会议预约核心逻辑：幂等创建、改期与单事务冲突检测。
 
 - 参与者 ID 去重并按字典序排序后，作为规范化请求内容参与幂等比较；
 - 区间一律按半开 ``[start, end)`` 处理：首尾相接（相邻）不算冲突；
 - 冲突检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务内完成：
   SQLite 在事务开始时即取写锁，并发请求被串行化；
   任一参与者与已有预约重叠都会整体回滚，不会留下部分写入。
+- 每条预约带单调递增的 ``version``（创建为 1）；改期采用乐观并发控制：
+  请求须携带 ``expected_version``，匹配才执行，成功后 ``version`` 加 1。
 """
 
 from __future__ import annotations
@@ -44,6 +46,26 @@ class RequestIdConflictError(Exception):
         )
 
 
+class ReservationNotFoundError(Exception):
+    """指定 ID 的预约不存在。"""
+
+    def __init__(self, reservation_id: int) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"reservation #{reservation_id} not found")
+
+
+class VersionConflictError(Exception):
+    """expected_version 与预约当前版本不一致（乐观锁）。"""
+
+    def __init__(self, reservation_id: int, current_version: int) -> None:
+        self.reservation_id = reservation_id
+        self.current_version = current_version
+        super().__init__(
+            f"expected_version does not match current version of reservation "
+            f"#{reservation_id}"
+        )
+
+
 @dataclass(frozen=True)
 class Reservation:
     id: int
@@ -52,6 +74,12 @@ class Reservation:
     end_utc: datetime
     participants: tuple[str, ...]
     created_at: datetime
+    version: int = 1
+
+
+_RESERVATION_COLUMNS = (
+    "id, request_id, start_utc, end_utc, participants_key, version, created_at"
+)
 
 
 def _canon(dt: datetime) -> str:
@@ -76,6 +104,7 @@ def _row_to_reservation(row: sqlite3.Row) -> Reservation:
         end_utc=_parse(row["end_utc"]),
         participants=tuple(json.loads(row["participants_key"])),
         created_at=_parse(row["created_at"]),
+        version=row["version"],
     )
 
 
@@ -107,7 +136,7 @@ def create_reservation(
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT id, request_id, start_utc, end_utc, participants_key, created_at"
+                f"SELECT {_RESERVATION_COLUMNS}"
                 " FROM reservations WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
@@ -140,8 +169,8 @@ def create_reservation(
             now_s = _canon(datetime.now(timezone.utc))
             cursor = conn.execute(
                 "INSERT INTO reservations"
-                " (request_id, start_utc, end_utc, participants_key, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
+                " (request_id, start_utc, end_utc, participants_key, version, created_at)"
+                " VALUES (?, ?, ?, ?, 1, ?)",
                 (request_id, start_s, end_s, participants_key, now_s),
             )
             reservation_id = int(cursor.lastrowid)
@@ -159,7 +188,112 @@ def create_reservation(
                 end_utc=_parse(end_s),
                 participants=participants,
                 created_at=_parse(now_s),
+                version=1,
             ), True
+        except BaseException:
+            # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def reschedule_reservation(
+    reservation_id: int,
+    expected_version: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    participant_ids: Iterable[str],
+    db_path: str | None = None,
+) -> Reservation:
+    """改期：原子替换预约时间与参与者占用，成功后 ``version`` 加 1。
+
+    整个流程在单个 ``BEGIN IMMEDIATE`` 事务内完成，任何一步失败都回滚，
+    预约行与参与者占用均保持原状：
+
+    1. 预约不存在 → :class:`ReservationNotFoundError`（API 层映射为 404）；
+    2. ``expected_version`` 与当前版本不一致 → :class:`VersionConflictError`
+       （409，携带 ``current_version``）；
+    3. 半开区间冲突检查：沿用创建时的重叠判定，但通过
+       ``reservation_id != ?`` **排除自身**（自身旧占用不算冲突）；
+       有冲突 → :class:`ReservationConflictError`（409 + 冲突明细）。
+
+    成功时更新 ``reservations`` 行（时间、规范化参与者、version+1）并整体
+    替换 ``reservation_participants`` 占用；``request_id`` 与 ``created_at``
+    保持不变。
+    """
+    participants = normalize_participants(participant_ids)
+    start_s = _canon(start_utc)
+    end_s = _canon(end_utc)
+    participants_key = json.dumps(list(participants), ensure_ascii=False)
+
+    path = db.ensure_initialized(db_path)
+    conn = db.connect(path)
+    try:
+        # BEGIN IMMEDIATE：与创建路径一致，事务开始即持写锁，
+        # “存在性 + 版本 + 冲突检查 + 替换” 对并发请求原子。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise ReservationNotFoundError(reservation_id)
+
+            current_version = row["version"]
+            if expected_version != current_version:
+                raise VersionConflictError(reservation_id, current_version)
+
+            conflicts: list[dict[str, object]] = []
+            for pid in participants:
+                # 半开区间重叠（同创建路径），reservation_id != ? 排除自身：
+                # 改期前自己在该参与者上的旧占用不应被视为冲突。
+                for hit in conn.execute(
+                    "SELECT reservation_id, participant_id"
+                    " FROM reservation_participants"
+                    " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
+                    " AND reservation_id != ?"
+                    " ORDER BY reservation_id",
+                    (pid, end_s, start_s, reservation_id),
+                ):
+                    conflicts.append({
+                        "reservation_id": hit["reservation_id"],
+                        "participant_id": hit["participant_id"],
+                    })
+            if conflicts:
+                raise ReservationConflictError(conflicts)
+
+            conn.execute(
+                "UPDATE reservations"
+                " SET start_utc = ?, end_utc = ?, participants_key = ?,"
+                "     version = version + 1"
+                " WHERE id = ?",
+                (start_s, end_s, participants_key, reservation_id),
+            )
+            # 参与者集合可能变化：先删除自身全部旧占用（子表行），再插入新占用。
+            # 子表删除不会反向影响 reservations 父表行；
+            # 两步与 UPDATE 同事务提交，失败即整体回滚。
+            conn.execute(
+                "DELETE FROM reservation_participants WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+            conn.executemany(
+                "INSERT INTO reservation_participants"
+                " (reservation_id, participant_id, start_utc, end_utc)"
+                " VALUES (?, ?, ?, ?)",
+                [(reservation_id, pid, start_s, end_s) for pid in participants],
+            )
+            conn.execute("COMMIT")
+            return Reservation(
+                id=reservation_id,
+                request_id=row["request_id"],
+                start_utc=_parse(start_s),
+                end_utc=_parse(end_s),
+                participants=participants,
+                created_at=_parse(row["created_at"]),
+                version=current_version + 1,
+            )
         except BaseException:
             # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚
             conn.rollback()

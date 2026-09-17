@@ -105,14 +105,9 @@ class AggregationResponse(BaseModel):
     segments: list[SegmentOut]
 
 
-class ReservationIn(BaseModel):
-    """会议预约请求：幂等创建，参与者区间占用检查。"""
+class _ReservationWindowBase(BaseModel):
+    """预约时间与参与者字段（创建/改期共用），规范化规则保持一致。"""
 
-    request_id: str = Field(
-        min_length=1, max_length=200,
-        description="客户端幂等请求标识；相同标识 + 相同规范化内容重试返回原预约",
-        examples=["req-9f3a"],
-    )
     start_utc: datetime = Field(
         description="UTC 开始时刻 ISO 8601（需带时区偏移，如 ...Z）",
         examples=["2026-03-09T13:00:00Z"],
@@ -123,7 +118,7 @@ class ReservationIn(BaseModel):
     )
     participant_ids: list[str] = Field(
         min_length=1,
-        description="参与者 ID 列表；去重排序后存储并参与幂等比较",
+        description="参与者 ID 列表；去重排序后存储并参与冲突检查",
         examples=[["alice", "bob"]],
     )
 
@@ -145,10 +140,30 @@ class ReservationIn(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _validate(self) -> "ReservationIn":
+    def _validate_window(self) -> "_ReservationWindowBase":
         if self.end_utc <= self.start_utc:
             raise ValueError("end_utc must be later than start_utc")
         return self
+
+
+class ReservationIn(_ReservationWindowBase):
+    """会议预约创建请求：幂等创建，参与者区间占用检查。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=200,
+        description="客户端幂等请求标识；相同标识 + 相同规范化内容重试返回原预约",
+        examples=["req-9f3a"],
+    )
+
+
+class ReservationRescheduleIn(_ReservationWindowBase):
+    """会议预约改期请求：乐观锁版本 + 新时间/参与者，沿用相同规范化规则。"""
+
+    expected_version: int = Field(
+        ge=1,
+        description="客户端上次读到的预约版本；与当前版本一致才执行改期",
+        examples=[1],
+    )
 
 
 class ReservationOut(BaseModel):
@@ -157,4 +172,5 @@ class ReservationOut(BaseModel):
     start_utc: str = Field(description="UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
     end_utc: str
     participants: list[str] = Field(description="参与者 id，去重后按字典序排列")
+    version: int = Field(description="乐观锁版本：创建为 1，每次成功改期加 1", examples=[1])
     created_at: str

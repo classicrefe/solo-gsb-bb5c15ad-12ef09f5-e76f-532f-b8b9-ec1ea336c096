@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     start_utc        TEXT NOT NULL,
     end_utc          TEXT NOT NULL,
     participants_key TEXT NOT NULL,  -- 规范化参与者列表（去重排序后的 JSON），用于幂等比较
+    version          INTEGER NOT NULL DEFAULT 1,  -- 乐观锁版本：创建为 1，每次改期 +1
     created_at       TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reservation_participants (
@@ -58,12 +59,25 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """建表（幂等）。应用启动时调用一次即可。"""
+    """建表（幂等）。应用启动时调用一次即可。
+
+    对升级前已存在的 SQLite 数据库执行**无损在线迁移**：
+    若 ``reservations`` 表缺少 ``version`` 列，则以 ``DEFAULT 1`` 补齐，
+    既有行自动得到 ``version=1``，其余数据（含参与者占用）保持不变。
+    """
     path = db_path or get_db_path()
     with _init_lock:
         conn = connect(path)
         try:
             conn.executescript(_SCHEMA)
+            columns = {row["name"] for row in conn.execute(
+                "PRAGMA table_info(reservations)")}
+            if "version" not in columns:
+                # ALTER TABLE ADD COLUMN 带 NOT NULL DEFAULT：
+                # 既有行立即获得默认值 1，不重写/删除任何数据
+                conn.execute(
+                    "ALTER TABLE reservations"
+                    " ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         finally:
             conn.close()
         _initialized.add(path)

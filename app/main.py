@@ -15,7 +15,12 @@ from fastapi.responses import JSONResponse
 from . import db as db_module
 from . import reservations as reservation_core
 from . import scheduling
-from .reservations import RequestIdConflictError, ReservationConflictError
+from .reservations import (
+    RequestIdConflictError,
+    ReservationConflictError,
+    ReservationNotFoundError,
+    VersionConflictError,
+)
 from .scheduling import SchedulingError
 from .schemas import (
     AggregationRequest,
@@ -24,6 +29,7 @@ from .schemas import (
     ParticipantIn,
     ReservationIn,
     ReservationOut,
+    ReservationRescheduleIn,
     SegmentOut,
     WEEKDAY_NAMES,
 )
@@ -44,9 +50,10 @@ app = FastAPI(
         "接收日期范围、会议时长、最低出席人数及每位参与者按本地星期/时刻填写的 "
         "重复可用区间与 IANA 时区，返回可安排会议的 UTC 候选时段及各自本地时刻。"
         "DST 按具体日期应用：不存在的本地时刻返回 400，歧义时刻统一取 fold=0。"
-        "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等。"
+        "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等，"
+        "并支持带乐观版本号的改期（PUT）。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -74,6 +81,22 @@ async def request_id_conflict_handler(request, exc: RequestIdConflictError) -> J
         content={
             "detail": str(exc),
             "existing_reservation_id": exc.existing_reservation_id,
+        },
+    )
+
+
+@app.exception_handler(ReservationNotFoundError)
+async def reservation_not_found_handler(request, exc: ReservationNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(VersionConflictError)
+async def version_conflict_handler(request, exc: VersionConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "current_version": exc.current_version,
         },
     )
 
@@ -163,6 +186,7 @@ def _reservation_to_out(r: reservation_core.Reservation) -> ReservationOut:
         start_utc=_iso_z(r.start_utc),
         end_utc=_iso_z(r.end_utc),
         participants=list(r.participants),
+        version=r.version,
         created_at=_iso_z(r.created_at),
     )
 
@@ -184,4 +208,28 @@ def create_reservation(req: ReservationIn, response: Response) -> ReservationOut
     if not created:
         # 幂等重放：返回原预约
         response.status_code = 200
+    return _reservation_to_out(reservation)
+
+
+@app.put("/api/v1/reservations/{reservation_id}", response_model=ReservationOut)
+def reschedule_reservation(
+    reservation_id: int, req: ReservationRescheduleIn
+) -> ReservationOut:
+    """改期（乐观并发控制）。
+
+    - 预约不存在 → 404；
+    - ``expected_version`` 与当前版本不一致 → 409，响应给出 ``current_version``；
+    - 任一新参与者与**其他**预约半开区间重叠（自动排除自身）→ 409 + 冲突明细；
+    - 成功 → 原子替换时间与参与者占用，``version`` 加 1，返回更新后的预约。
+
+    所有检查与写入在单个 ``BEGIN IMMEDIATE`` 事务内完成；任一步失败，
+    预约及其参与者占用均保持原状。
+    """
+    reservation = reservation_core.reschedule_reservation(
+        reservation_id=reservation_id,
+        expected_version=req.expected_version,
+        start_utc=req.start_utc,
+        end_utc=req.end_utc,
+        participant_ids=req.participant_ids,
+    )
     return _reservation_to_out(reservation)
