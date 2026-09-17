@@ -1,7 +1,7 @@
 # 跨时区可用时段聚合 API
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
-并附带 **SQLite 持久化的会议预约接口**（幂等创建 + 单事务冲突检测）。
+并附带 **SQLite 持久化的会议预约接口**（幂等创建 + 单事务冲突检测 + 乐观锁改期）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -28,11 +28,11 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、单事务冲突检测
-  db.py            # SQLite 连接管理与建表（路径可配置）
+  reservations.py  # 预约核心：规范化、幂等创建、单事务冲突检测、乐观锁改期
+  db.py            # SQLite 连接管理、建表与无损迁移（路径可配置）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发/改期）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -56,7 +56,8 @@ requirements-dev.txt  # 测试依赖（含 pytest、httpx）
 docker compose up --build
 ```
 
-启动时应用会**自动初始化 SQLite 数据库**（建表幂等）；数据库文件落在命名卷
+启动时应用会**自动初始化 SQLite 数据库**（建表幂等；对早期没有 `version` 列的
+既有数据库会无损补齐该列并回填 `1`，不改动任何既有数据）；数据库文件落在命名卷
 `reservations-data`（容器内 `/data`）上，容器重建后预约数据不丢失。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
@@ -209,7 +210,8 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
   "start_utc": "2026-03-09T13:00:00Z",
   "end_utc": "2026-03-09T14:00:00Z",
   "participants": ["alice", "bob"],
-  "created_at": "2026-09-17T20:42:39.634009Z"
+  "created_at": "2026-09-17T20:42:39.634009Z",
+  "version": 1
 }
 ```
 
@@ -233,6 +235,71 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
 
 其他错误：`422`（`end_utc` 不晚于 `start_utc`、时间缺时区偏移、参与者列表为空等）。
 
+### `PUT /api/v1/reservations/{reservation_id}`
+
+改期（乐观锁）。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `expected_version` | 整数 ≥ 1 | 客户端持有的当前版本号（来自创建/上次改期响应的 `version`） |
+| `start_utc` / `end_utc` | ISO 8601（须带时区偏移，如 `...Z`） | 新的 UTC 起止时刻；`end_utc` 必须晚于 `start_utc` |
+| `participant_ids` | 非空字符串数组 | 新的参与者全集（整体替换，去重并排序后存储） |
+
+语义：
+
+- **原子替换**：存在性、版本校验、冲突检查与写入在单个 `BEGIN IMMEDIATE`
+  事务内完成；任一步失败整体回滚，预约与参与者占用保持不变。
+- **乐观锁**：`expected_version` 与当前 `version` 不一致 → `409` 并返回
+  `current_version`；成功改期后 `version` 加 1。
+- **冲突检查排除自身**：本预约旧的参与者占用不参与判定；与其他预约存在
+  半开区间重叠 → `409` 及冲突明细（与创建相同规则，相邻区间不冲突）。
+- 预约不存在 → `404`。
+
+请求示例：
+
+```bash
+curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 1,
+    "start_utc": "2026-03-10T15:00:00Z",
+    "end_utc": "2026-03-10T16:00:00Z",
+    "participant_ids": ["alice", "carol"]
+  }'
+```
+
+成功响应（`200`，`version` 已加 1）：
+
+```json
+{
+  "reservation_id": 1,
+  "request_id": "req-9f3a",
+  "start_utc": "2026-03-10T15:00:00Z",
+  "end_utc": "2026-03-10T16:00:00Z",
+  "participants": ["alice", "carol"],
+  "created_at": "2026-09-17T20:42:39.634009Z",
+  "version": 2
+}
+```
+
+版本过期（`409`，`current_version` 为服务器当前版本）：
+
+```json
+{
+  "detail": "reservation #1 version mismatch: current version is 2",
+  "current_version": 2
+}
+```
+
+预约不存在（`404`）：
+
+```json
+{"detail": "reservation #42 not found"}
+```
+
+参与者冲突的 `409` 响应格式与创建接口相同（`conflicts` 明细）；
+`422` 校验规则（时间窗、时区偏移、参与者列表）也与创建一致。
+
 ## 测试覆盖要点
 
 - **春季跳变**：不存在的钟面时刻报错；跨越跳变间隙的窗口 UTC 时长缩短（柏林 2026-03-29 00:00–04:00 实际只有 3 小时）。
@@ -242,6 +309,11 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
 - **预约**：半开区间各方向重叠均 409、相邻区间不冲突、冲突无部分写入、
   幂等重放返回原预约且不新增记录、`request_id` 内容不同 409、
   多线程并发下同一时段仅一个赢家、并发重放只建一条记录。
+- **改期**：成功改期原子替换预约与占用且 `version` 加 1、旧时段立即释放、
+  预约不存在 404、版本过期 409 且携带 `current_version`、
+  冲突检查排除自身（与自身旧时段重叠/与他人相邻均可改期）、
+  失败改期不留任何部分变更、并发改期同一预约仅一个赢家、
+  无 `version` 列的旧库启动时无损补齐 `version=1`。
 
 ```bash
 pytest -q

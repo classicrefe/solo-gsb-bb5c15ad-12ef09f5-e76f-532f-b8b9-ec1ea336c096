@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS reservations (
     start_utc        TEXT NOT NULL,
     end_utc          TEXT NOT NULL,
     participants_key TEXT NOT NULL,  -- 规范化参与者列表（去重排序后的 JSON），用于幂等比较
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1  -- 乐观锁版本号：创建为 1，每次改期 +1
 );
 CREATE TABLE IF NOT EXISTS reservation_participants (
     reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
@@ -57,13 +58,28 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有数据库做无损补齐（CREATE TABLE IF NOT EXISTS 管不到旧表）。
+
+    目前只有一项：为早期没有 version 列的 reservations 表追加该列。
+    SQLite 会为既有行回填默认值 1，不改动任何既有数据。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "version" not in columns:
+        conn.execute(
+            "ALTER TABLE reservations"
+            " ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+        )
+
+
 def init_db(db_path: str | None = None) -> None:
-    """建表（幂等）。应用启动时调用一次即可。"""
+    """建表 + 无损迁移（幂等）。应用启动时调用一次即可。"""
     path = db_path or get_db_path()
     with _init_lock:
         conn = connect(path)
         try:
             conn.executescript(_SCHEMA)
+            _migrate(conn)
         finally:
             conn.close()
         _initialized.add(path)
